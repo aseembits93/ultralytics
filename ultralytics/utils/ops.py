@@ -65,7 +65,9 @@ class Profile(contextlib.ContextDecorator):
 
     def time(self):
         """Get current time with CUDA synchronization if applicable."""
-        if self.cuda:
+        import os
+
+        if self.cuda and os.environ.get("ULTRALYTICS_PROFILE_SYNC", "1") != "0":
             torch.cuda.synchronize(self.device)
         return time.perf_counter()
 
@@ -503,9 +505,11 @@ def process_mask(protos, masks_in, bboxes, shape, upsample: bool = False):
 
     width_ratio = mw / shape[1]
     height_ratio = mh / shape[0]
-    ratios = torch.tensor([[width_ratio, height_ratio, width_ratio, height_ratio]], device=bboxes.device)
+    scaled_bboxes = torch.empty_like(bboxes)
+    scaled_bboxes[:, 0::2] = bboxes[:, 0::2] * width_ratio
+    scaled_bboxes[:, 1::2] = bboxes[:, 1::2] * height_ratio
 
-    masks = crop_mask(masks, boxes=bboxes * ratios)  # NHW
+    masks = crop_mask(masks, boxes=scaled_bboxes)  # NHW
     if upsample:
         masks = F.interpolate(masks[None], shape, mode="bilinear")[0]  # NHW
     return masks.gt_(0.0).byte()

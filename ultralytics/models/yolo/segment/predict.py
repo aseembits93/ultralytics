@@ -54,14 +54,21 @@ class SegmentationPredictor(DetectionPredictor):
             orig_imgs (list | torch.Tensor | np.ndarray): Original image or batch of images.
 
         Returns:
-            (list): List of Results objects containing the segmentation predictions for each image in the batch. Each
-                Results object includes both bounding boxes and segmentation masks.
-
-        Examples:
-            >>> predictor = SegmentationPredictor(overrides=dict(model="yolo26n-seg.pt"))
-            >>> results = predictor.postprocess(preds, img, orig_img)
+            (list): List of Results objects containing the segmentation predictions for each image in the batch.
         """
-        # Extract protos - tuple if PyTorch model or array if exported
+        import torch
+
+        backend = getattr(self.model, "backend", None)
+        post_stream = getattr(backend, "post_stream", None)
+        if post_stream is not None:
+            produce_event = backend.produce_event
+            if produce_event is not None:
+                post_stream.wait_event(produce_event)
+            with torch.cuda.stream(post_stream):
+                protos = preds[0][1] if isinstance(preds[0], tuple) else preds[1]
+                results = super().postprocess(preds[0], img, orig_imgs, protos=protos)
+            return results
+
         protos = preds[0][1] if isinstance(preds[0], tuple) else preds[1]
         return super().postprocess(preds[0], img, orig_imgs, protos=protos)
 
@@ -96,16 +103,28 @@ class SegmentationPredictor(DetectionPredictor):
         Returns:
             (Results): Result object containing the original image, image path, class names, bounding boxes, and masks.
         """
+        import os as _os
+
+        _use_triton_post = _os.environ.get("ULTRALYTICS_TRITON_POST", "1") != "0"
         if pred.shape[0] == 0:  # save empty boxes
             masks = None
         elif self.args.retina_masks:
             pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
             masks = ops.process_mask_native(proto, pred[:, 6:], pred[:, :4], orig_img.shape[:2])  # NHW
+        elif _use_triton_post:
+            from ultralytics.nn.triton_postprocess import fused_process_mask
+
+            masks = fused_process_mask(proto, pred[:, 6:], pred[:, :4], img.shape[2:])
+            pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
         else:
             masks = ops.process_mask(proto, pred[:, 6:], pred[:, :4], img.shape[2:], upsample=True)  # NHW
             pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
         if masks is not None:
             keep = masks.amax((-2, -1)) > 0  # only keep predictions with masks
-            if not all(keep):  # most predictions have masks
-                pred, masks = pred[keep], masks[keep]  # indexing is slow
+            if _use_triton_post:
+                need_filter = not bool(keep.all())  # single DtoH scalar
+            else:
+                need_filter = not all(keep)  # original element-wise path
+            if need_filter:
+                pred, masks = pred[keep], masks[keep]
         return Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6], masks=masks)
