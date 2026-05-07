@@ -14,12 +14,12 @@ import triton.language as tl
 
 @triton.jit
 def _fused_process_mask_kernel(
-    coeffs_ptr,       # (N_DET, N_COEFF) fp32
-    protos_ptr,       # (N_COEFF, PROTO_H, PROTO_W) fp32
-    boxes_ptr,        # (N_DET, 4) xyxy in IMG space
-    out_ptr,          # (N_DET, OUT_H, OUT_W) uint8
-    H_RATIO,          # PROTO_H / IMG_H (float)
-    W_RATIO,          # PROTO_W / IMG_W (float)
+    coeffs_ptr,  # (N_DET, N_COEFF) fp32
+    protos_ptr,  # (N_COEFF, PROTO_H, PROTO_W) fp32
+    boxes_ptr,  # (N_DET, 4) xyxy in IMG space
+    out_ptr,  # (N_DET, OUT_H, OUT_W) uint8
+    H_RATIO,  # PROTO_H / IMG_H (float)
+    W_RATIO,  # PROTO_W / IMG_W (float)
     N_COEFF: tl.constexpr,
     PROTO_H: tl.constexpr,
     PROTO_W: tl.constexpr,
@@ -97,11 +97,11 @@ def _fused_process_mask_kernel(
 
 @triton.jit
 def _fused_process_mask_kernel_tile_major(
-    coeffs_ptr,       # (N_DET_MAX, N_COEFF) fp32
-    protos_ptr,       # (N_COEFF, PROTO_H, PROTO_W) fp32
-    boxes_ptr,        # (N_DET_MAX, 4) xyxy in IMG space
-    confs_ptr,        # (N_DET_MAX,) fp32
-    out_ptr,          # (N_DET_MAX, OUT_H, OUT_W) uint8 — pre-zeroed
+    coeffs_ptr,  # (N_DET_MAX, N_COEFF) fp32
+    protos_ptr,  # (N_COEFF, PROTO_H, PROTO_W) fp32
+    boxes_ptr,  # (N_DET_MAX, 4) xyxy in IMG space
+    confs_ptr,  # (N_DET_MAX,) fp32
+    out_ptr,  # (N_DET_MAX, OUT_H, OUT_W) uint8 — pre-zeroed
     conf_thres,
     H_RATIO,
     W_RATIO,
@@ -141,7 +141,7 @@ def _fused_process_mask_kernel_tile_major(
     tile_hw = OUT_H * OUT_W
 
     # Pre-load protos corners for this tile once, shared across all dets
-    p00_chan = tl.zeros((N_COEFF, BLOCK_H, BLOCK_W), dtype=tl.float32)
+    tl.zeros((N_COEFF, BLOCK_H, BLOCK_W), dtype=tl.float32)
     # Triton doesn't easily support 3D arrays with constexpr first dim for loads; fall back to per-coeff inner loop
     # with per-det wrapping.
 
@@ -221,10 +221,19 @@ def fused_process_mask(
     BLOCK_H, BLOCK_W = 16, 16
     grid = (N, triton.cdiv(out_h, BLOCK_H), triton.cdiv(out_w, BLOCK_W))
     _fused_process_mask_kernel[grid](
-        coeffs_c, protos_c, boxes_c, out,
-        h_ratio, w_ratio,
-        C, Ph, Pw, out_h, out_w,
-        BLOCK_H, BLOCK_W,
+        coeffs_c,
+        protos_c,
+        boxes_c,
+        out,
+        h_ratio,
+        w_ratio,
+        C,
+        Ph,
+        Pw,
+        out_h,
+        out_w,
+        BLOCK_H,
+        BLOCK_W,
     )
     return out
 
@@ -262,7 +271,13 @@ def fused_process_mask_full(
         float(conf_thres),
         Ph / out_h,
         Pw / out_w,
-        N, C, Ph, Pw, out_h, out_w,
-        BLOCK_H, BLOCK_W,
+        N,
+        C,
+        Ph,
+        Pw,
+        out_h,
+        out_w,
+        BLOCK_H,
+        BLOCK_W,
     )
     return out

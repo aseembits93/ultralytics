@@ -66,6 +66,7 @@ class Profile(contextlib.ContextDecorator):
     def time(self):
         """Get current time with CUDA synchronization if applicable."""
         import os
+
         if self.cuda and os.environ.get("ULTRALYTICS_PROFILE_SYNC", "1") != "0":
             torch.cuda.synchronize(self.device)
         return time.perf_counter()

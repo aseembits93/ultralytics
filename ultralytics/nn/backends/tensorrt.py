@@ -123,8 +123,7 @@ class TensorRTBackend(BaseBackend):
         self._consumer_done_event = None
         self._pipeline_post = os.environ.get("ULTRALYTICS_TRT_PIPELINE_POST", "0") == "1"
         self._use_graph = (
-            not self.dynamic and self.is_trt10
-            and os.environ.get("ULTRALYTICS_TRT_CUDA_GRAPH", "1") != "0"
+            not self.dynamic and self.is_trt10 and os.environ.get("ULTRALYTICS_TRT_CUDA_GRAPH", "1") != "0"
         )
         if self._use_graph:
             for name, binding in self.bindings.items():
@@ -144,7 +143,7 @@ class TensorRTBackend(BaseBackend):
 
     @property
     def produce_event(self) -> torch.cuda.Event | None:
-        """Event signalling that clone of TRT outputs is complete on graph_stream."""
+        """Event signaling that clone of TRT outputs is complete on graph_stream."""
         return self._graph_event if getattr(self, "_pipeline_post", False) else None
 
     def forward(self, im: torch.Tensor) -> list[torch.Tensor]:
@@ -195,8 +194,7 @@ class TensorRTBackend(BaseBackend):
                     # Ring of 3 clone sets: depth-2 pipelining + 1 for headroom.
                     sorted_names = sorted(self.output_names)
                     self._clone_sets = [
-                        [torch.empty_like(self.bindings[n].data) for n in sorted_names]
-                        for _ in range(3)
+                        [torch.empty_like(self.bindings[n].data) for n in sorted_names] for _ in range(3)
                     ]
             elif im.data_ptr() != input_buf.data_ptr():
                 input_buf.copy_(im, non_blocking=True)
