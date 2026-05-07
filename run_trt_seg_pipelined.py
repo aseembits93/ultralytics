@@ -149,13 +149,24 @@ def run_threaded():
     input_binding = backend.input_tensor
     img_shape_hw = tuple(input_binding.shape[2:])
 
-    src_pinned = torch.empty(frames[0].shape, dtype=torch.uint8, pin_memory=True)
-    src_gpu = torch.empty(frames[0].shape, dtype=torch.uint8, device=device)
+    # Ring of pinned host + device staging buffers for preprocess. Single buffers
+    # race here: main thread's next `src_pinned.copy_(np_frame)` CPU write can
+    # stomp on the previous HtoD's source before the DMA engine has read it.
+    # Sized to the semaphore so the main thread can only cycle as far as the
+    # worker permits.
+    PRE_RING = 6
+    src_pinned_ring = [torch.empty(frames[0].shape, dtype=torch.uint8, pin_memory=True) for _ in range(PRE_RING)]
+    src_gpu_ring = [torch.empty(frames[0].shape, dtype=torch.uint8, device=device) for _ in range(PRE_RING)]
+    pre_idx = [0]
 
     def submit_inference(frame_np: np.ndarray):
-        src_pinned.copy_(torch.from_numpy(frame_np))
-        src_gpu.copy_(src_pinned, non_blocking=True)
-        letterbox_preprocess(src_gpu, input_binding)
+        i = pre_idx[0]
+        pre_idx[0] = (i + 1) % PRE_RING
+        sp = src_pinned_ring[i]
+        sg = src_gpu_ring[i]
+        sp.copy_(torch.from_numpy(frame_np))
+        sg.copy_(sp, non_blocking=True)
+        letterbox_preprocess(sg, input_binding)
         preds = backend.forward(input_binding)
         return preds, backend.last_clone_slot
 
@@ -185,12 +196,14 @@ def run_threaded():
             decode(p, s)
     torch.cuda.synchronize()
 
-    q: queue.Queue = queue.Queue(maxsize=6)
+    q: queue.Queue = queue.Queue()
     SENTINEL = object()
 
-    # Worker consumes inference outputs off the main thread so the submit loop can
-    # keep queuing graph replays. `decode` internally blocks on a host-sync inside
-    # NMS; running it off-thread lets the main thread stay in the submit path.
+    # Semaphore caps how many forwards are in flight ahead of the worker. If set
+    # >= ring_size, the backend's clone ring can wrap before the worker has
+    # decoded the oldest slot — reading corrupted data. Ring size default is 8.
+    in_flight = threading.Semaphore(value=6)
+
     def worker():
         with torch.inference_mode():
             while True:
@@ -199,6 +212,12 @@ def run_threaded():
                     return
                 preds, slot, _i = item
                 decode(preds, slot)
+                # Release after decode returns (host-side, so all post_stream ops
+                # have been queued AND `mark_slot_consumed` has been recorded on
+                # post_stream). The slot is still being read by post_stream kernels
+                # but the backend gates the next replay that reuses the slot on
+                # `slot_consumed[slot]`, so the main thread can safely reuse it.
+                in_flight.release()
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
@@ -206,6 +225,7 @@ def run_threaded():
     with torch.inference_mode():
         t0 = time.perf_counter()
         for i, f in enumerate(frames):
+            in_flight.acquire()  # CPU-side backpressure
             preds, slot = submit_inference(f)
             q.put((preds, slot, i))
         q.put(SENTINEL)
