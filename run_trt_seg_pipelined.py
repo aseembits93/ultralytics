@@ -1,12 +1,17 @@
 """Depth-2 pipelined benchmark for the TRT segmentation path.
 
-Two modes, selected by `MODE`:
+Three modes, selected by `MODE`:
 - `MODE=baseline`: synchronous `model.predict(frame)` with every optimization disabled
   (no CUDA graph, no triton pre/post, no pipelining). Reproduces the ~298 FPS number.
-- `MODE=best` (default): depth-2 pipeline — submit frame N+1's preprocess+forward
-  while frame N's postprocess runs on a dedicated stream. Reproduces ~402 FPS.
+- `MODE=best` (default): depth-2 pipeline — submit frame N+1's preprocess+forward while
+  frame N's postprocess runs on a dedicated stream. Reproduces ~402 FPS.
+- `MODE=threaded`: main thread only submits inference; a worker thread drains the
+  post-queue (`produce_event` -> NMS + mask kernel + host sync for the boolean-mask
+  indexing). Main thread's only sync point is the ring-slot availability, not the
+  mid-NMS `bool(keep.all())` DtoH. Aims to hide the ~285 µs per-frame gap between
+  consecutive graph replays observed in the `best` profile.
 
-Both modes time 538 frames of `vehicles_312px.mp4` (pre-loaded before the model loads).
+All modes time 538 frames of `vehicles_312px.mp4` (pre-loaded before the model loads).
 """
 
 import os
@@ -133,6 +138,92 @@ def run_best():
     return elapsed
 
 
-elapsed = run_baseline() if MODE == "baseline" else run_best()
+def run_threaded():
+    """Depth-2 pipeline with postprocess on a worker thread."""
+    import threading
+    import queue
+
+    backend = model.predictor.model.backend
+    assert backend.post_stream is not None, "pipelining not enabled"
+    device = backend.device
+    input_binding = backend.input_tensor
+    img_shape_hw = tuple(input_binding.shape[2:])
+
+    src_pinned = torch.empty(frames[0].shape, dtype=torch.uint8, pin_memory=True)
+    src_gpu = torch.empty(frames[0].shape, dtype=torch.uint8, device=device)
+
+    def submit_inference(frame_np: np.ndarray):
+        src_pinned.copy_(torch.from_numpy(frame_np))
+        src_gpu.copy_(src_pinned, non_blocking=True)
+        letterbox_preprocess(src_gpu, input_binding)
+        preds = backend.forward(input_binding)
+        return preds, backend.last_clone_slot
+
+    def decode(preds, slot):
+        post_stream = backend.post_stream
+        post_stream.wait_event(backend.produce_event)
+        with torch.cuda.stream(post_stream):
+            dets_batched = preds[0]
+            protos = preds[1][0]
+            filtered = non_max_suppression(
+                dets_batched, CONF, 0.45, None, end2end=True, max_det=300
+            )[0]
+            if filtered.shape[0] == 0:
+                boxes, masks = filtered[:, :6], None
+            else:
+                masks = fused_process_mask(
+                    protos, filtered[:, 6:], filtered[:, :4], img_shape_hw
+                )
+                keep = masks.amax((-2, -1)) > 0
+                if not bool(keep.all()):
+                    filtered = filtered[keep]
+                    masks = masks[keep]
+                boxes = filtered[:, :6]
+        backend.mark_slot_consumed(slot, post_stream)
+        return boxes, masks
+
+    # Warmup.
+    with torch.inference_mode():
+        for _ in range(2):
+            p, s = submit_inference(frames[0])
+            decode(p, s)
+    torch.cuda.synchronize()
+
+    q: "queue.Queue" = queue.Queue(maxsize=6)
+    SENTINEL = object()
+
+    # Worker consumes inference outputs off the main thread so the submit loop can
+    # keep queuing graph replays. `decode` internally blocks on a host-sync inside
+    # NMS; running it off-thread lets the main thread stay in the submit path.
+    def worker():
+        with torch.inference_mode():
+            while True:
+                item = q.get()
+                if item is SENTINEL:
+                    return
+                preds, slot, i = item
+                decode(preds, slot)
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+    with torch.inference_mode():
+        t0 = time.perf_counter()
+        for i, f in enumerate(frames):
+            preds, slot = submit_inference(f)
+            q.put((preds, slot, i))
+        q.put(SENTINEL)
+        t.join()
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+    return elapsed
+
+
+if MODE == "baseline":
+    elapsed = run_baseline()
+elif MODE == "threaded":
+    elapsed = run_threaded()
+else:
+    elapsed = run_best()
 fps = len(frames) / elapsed
 print(f"[mode={MODE}] Processed {len(frames)} frames in {elapsed:.3f}s -> {fps:.2f} FPS")
