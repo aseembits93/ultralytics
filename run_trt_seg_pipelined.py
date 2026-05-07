@@ -140,8 +140,8 @@ def run_best():
 
 def run_threaded():
     """Depth-2 pipeline with postprocess on a worker thread."""
-    import threading
     import queue
+    import threading
 
     backend = model.predictor.model.backend
     assert backend.post_stream is not None, "pipelining not enabled"
@@ -165,15 +165,11 @@ def run_threaded():
         with torch.cuda.stream(post_stream):
             dets_batched = preds[0]
             protos = preds[1][0]
-            filtered = non_max_suppression(
-                dets_batched, CONF, 0.45, None, end2end=True, max_det=300
-            )[0]
+            filtered = non_max_suppression(dets_batched, CONF, 0.45, None, end2end=True, max_det=300)[0]
             if filtered.shape[0] == 0:
                 boxes, masks = filtered[:, :6], None
             else:
-                masks = fused_process_mask(
-                    protos, filtered[:, 6:], filtered[:, :4], img_shape_hw
-                )
+                masks = fused_process_mask(protos, filtered[:, 6:], filtered[:, :4], img_shape_hw)
                 keep = masks.amax((-2, -1)) > 0
                 if not bool(keep.all()):
                     filtered = filtered[keep]
@@ -189,7 +185,7 @@ def run_threaded():
             decode(p, s)
     torch.cuda.synchronize()
 
-    q: "queue.Queue" = queue.Queue(maxsize=6)
+    q: queue.Queue = queue.Queue(maxsize=6)
     SENTINEL = object()
 
     # Worker consumes inference outputs off the main thread so the submit loop can
@@ -201,7 +197,7 @@ def run_threaded():
                 item = q.get()
                 if item is SENTINEL:
                     return
-                preds, slot, i = item
+                preds, slot, _i = item
                 decode(preds, slot)
 
     t = threading.Thread(target=worker, daemon=True)
