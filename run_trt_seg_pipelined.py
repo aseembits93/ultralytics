@@ -31,8 +31,8 @@ else:
     os.environ.setdefault("ULTRALYTICS_PROFILE_SYNC", "0")
 
 from ultralytics import YOLO
-from ultralytics.nn.triton_preprocess import letterbox_preprocess
 from ultralytics.nn.triton_postprocess import fused_process_mask
+from ultralytics.nn.triton_preprocess import letterbox_preprocess
 from ultralytics.utils.nms import non_max_suppression
 
 VIDEO = "vehicles_312px.mp4"
@@ -90,14 +90,10 @@ def run_best():
         with torch.cuda.stream(post_stream):
             dets_batched = preds[0]
             protos = preds[1][0]
-            filtered = non_max_suppression(
-                dets_batched, CONF, 0.45, None, end2end=True, max_det=300
-            )[0]
+            filtered = non_max_suppression(dets_batched, CONF, 0.45, None, end2end=True, max_det=300)[0]
             if filtered.shape[0] == 0:
                 return filtered[:, :6], None
-            masks = fused_process_mask(
-                protos, filtered[:, 6:], filtered[:, :4], img_shape_hw
-            )
+            masks = fused_process_mask(protos, filtered[:, 6:], filtered[:, :4], img_shape_hw)
             keep = masks.amax((-2, -1)) > 0
             if not bool(keep.all()):
                 filtered = filtered[keep]

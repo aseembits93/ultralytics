@@ -104,6 +104,7 @@ class SegmentationPredictor(DetectionPredictor):
             (Results): Result object containing the original image, image path, class names, bounding boxes, and masks.
         """
         import os as _os
+
         _use_triton_post = _os.environ.get("ULTRALYTICS_TRITON_POST", "1") != "0"
         if pred.shape[0] == 0:  # save empty boxes
             masks = None
