@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import OrderedDict, namedtuple
 from pathlib import Path
 
@@ -112,6 +113,40 @@ class TensorRTBackend(BaseBackend):
         self.binding_addrs = OrderedDict((n, d.ptr) for n, d in self.bindings.items())
         self.model = engine
 
+        self._graph = None
+        self._graph_stream = None
+        self._graph_outputs = None
+        self._graph_event = None
+        self._post_stream = None
+        self._clone_sets = None
+        self._clone_idx = 0
+        self._consumer_done_event = None
+        self._pipeline_post = os.environ.get("ULTRALYTICS_TRT_PIPELINE_POST", "0") == "1"
+        self._use_graph = (
+            not self.dynamic and self.is_trt10
+            and os.environ.get("ULTRALYTICS_TRT_CUDA_GRAPH", "1") != "0"
+        )
+        if self._use_graph:
+            for name, binding in self.bindings.items():
+                self.context.set_tensor_address(name, binding.ptr)
+
+    @property
+    def input_tensor(self) -> torch.Tensor | None:
+        """Return the fixed TRT input binding as a torch tensor, or None if not a static engine."""
+        if getattr(self, "_use_graph", False):
+            return self.bindings["images"].data
+        return None
+
+    @property
+    def post_stream(self) -> torch.cuda.Stream | None:
+        """Dedicated CUDA stream postprocess should run on when pipelining is enabled."""
+        return self._post_stream if getattr(self, "_pipeline_post", False) else None
+
+    @property
+    def produce_event(self) -> torch.cuda.Event | None:
+        """Event signalling that clone of TRT outputs is complete on graph_stream."""
+        return self._graph_event if getattr(self, "_pipeline_post", False) else None
+
     def forward(self, im: torch.Tensor) -> list[torch.Tensor]:
         """Run NVIDIA TensorRT inference with dynamic shape handling.
 
@@ -137,6 +172,57 @@ class TensorRTBackend(BaseBackend):
 
         s = self.bindings["images"].shape
         assert im.shape == s, f"input size {im.shape} {'>' if self.dynamic else 'not equal to'} max model size {s}"
+
+        if self._use_graph:
+            input_buf = self.bindings["images"].data
+            if self._graph is None:
+                if im.data_ptr() != input_buf.data_ptr():
+                    input_buf.copy_(im)
+                self._graph_stream = torch.cuda.Stream(device=self.device)
+                self._graph_stream.wait_stream(torch.cuda.current_stream(self.device))
+                with torch.cuda.stream(self._graph_stream):
+                    for _ in range(3):
+                        self.context.execute_async_v3(self._graph_stream.cuda_stream)
+                self._graph_stream.synchronize()
+                self._graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(self._graph, stream=self._graph_stream):
+                    self.context.execute_async_v3(self._graph_stream.cuda_stream)
+                self._graph_outputs = [self.bindings[x].data for x in sorted(self.output_names)]
+                self._graph_event = torch.cuda.Event()
+                if self._pipeline_post:
+                    self._post_stream = torch.cuda.Stream(device=self.device)
+                    self._consumer_done_event = torch.cuda.Event()
+                    # Ring of 3 clone sets: depth-2 pipelining + 1 for headroom.
+                    sorted_names = sorted(self.output_names)
+                    self._clone_sets = [
+                        [torch.empty_like(self.bindings[n].data) for n in sorted_names]
+                        for _ in range(3)
+                    ]
+            elif im.data_ptr() != input_buf.data_ptr():
+                input_buf.copy_(im, non_blocking=True)
+            current = torch.cuda.current_stream(self.device)
+            self._graph_stream.wait_stream(current)
+            if self._pipeline_post and self._consumer_done_event is not None:
+                # Next replay must wait for previous frame's clone to finish.
+                self._graph_stream.wait_event(self._consumer_done_event)
+            # CUDAGraph.replay() launches on the current stream, so switch to
+            # graph_stream for the launch and all follow-up clone work.
+            with torch.cuda.stream(self._graph_stream):
+                self._graph.replay()
+                if self._pipeline_post:
+                    sorted_names = sorted(self.output_names)
+                    idx = self._clone_idx
+                    self._clone_idx = (idx + 1) % len(self._clone_sets)
+                    clones = self._clone_sets[idx]
+                    for c, name in zip(clones, sorted_names):
+                        c.copy_(self.bindings[name].data, non_blocking=True)
+                    self._graph_event.record(self._graph_stream)
+                    self._consumer_done_event.record(self._graph_stream)
+            if self._pipeline_post:
+                current.wait_stream(self._graph_stream)
+                return list(clones)
+            current.wait_stream(self._graph_stream)
+            return self._graph_outputs
 
         self.binding_addrs["images"] = int(im.data_ptr())
         self.context.execute_v2(list(self.binding_addrs.values()))

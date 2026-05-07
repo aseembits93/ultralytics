@@ -159,6 +159,29 @@ class BasePredictor:
             (torch.Tensor): Preprocessed image tensor of shape (N, 3, H, W).
         """
         not_tensor = not isinstance(im, torch.Tensor)
+        dst = getattr(getattr(self.model, "backend", None), "input_tensor", None)
+        if (
+            not_tensor
+            and dst is not None
+            and dst.dtype in (torch.float16, torch.float32)
+            and len(im) == 1
+            and im[0].ndim == 3
+            and im[0].shape[-1] == 3
+            and im[0].dtype == np.uint8
+        ):
+            from ultralytics.nn.triton_preprocess import letterbox_preprocess
+
+            src = im[0]
+            pinned = getattr(self, "_pinned_src", None)
+            if pinned is None or pinned.shape != src.shape:
+                pinned = torch.empty(src.shape, dtype=torch.uint8, pin_memory=True)
+                self._pinned_src = pinned
+                self._src_gpu = torch.empty(src.shape, dtype=torch.uint8, device=self.device)
+            pinned.copy_(torch.from_numpy(src), non_blocking=False)
+            self._src_gpu.copy_(pinned, non_blocking=True)
+            letterbox_preprocess(self._src_gpu, dst)
+            return dst
+
         if not_tensor:
             im = np.stack(self.pre_transform(im))
             if im.shape[-1] == 3:
