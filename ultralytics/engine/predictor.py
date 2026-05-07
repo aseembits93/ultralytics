@@ -158,10 +158,13 @@ class BasePredictor:
         Returns:
             (torch.Tensor): Preprocessed image tensor of shape (N, 3, H, W).
         """
+        import os as _os
+        _use_triton_pre = _os.environ.get("ULTRALYTICS_TRITON_PRE", "1") != "0"
         not_tensor = not isinstance(im, torch.Tensor)
         dst = getattr(getattr(self.model, "backend", None), "input_tensor", None)
         if (
-            not_tensor
+            _use_triton_pre
+            and not_tensor
             and dst is not None
             and dst.dtype in (torch.float16, torch.float32)
             and len(im) == 1

@@ -146,6 +146,20 @@ class TensorRTBackend(BaseBackend):
         """Event signaling that clone of TRT outputs is complete on graph_stream."""
         return self._graph_event if getattr(self, "_pipeline_post", False) else None
 
+    @property
+    def last_clone_slot(self) -> int | None:
+        """Ring-buffer slot index of the most recent `forward()` output. Use with `mark_slot_consumed`."""
+        return getattr(self, "_last_issued_slot", None)
+
+    def mark_slot_consumed(self, slot: int, stream: torch.cuda.Stream) -> None:
+        """Record that `stream` has finished reading the clone at `slot`.
+
+        Next replay that reuses `slot` will wait on this event, preventing
+        the clone-copy from overwriting in-flight reads.
+        """
+        if self._pipeline_post and self._slot_consumed is not None:
+            self._slot_consumed[slot].record(stream)
+
     def forward(self, im: torch.Tensor) -> list[torch.Tensor]:
         """Run NVIDIA TensorRT inference with dynamic shape handling.
 
@@ -191,18 +205,29 @@ class TensorRTBackend(BaseBackend):
                 if self._pipeline_post:
                     self._post_stream = torch.cuda.Stream(device=self.device)
                     self._consumer_done_event = torch.cuda.Event()
-                    # Ring of 3 clone sets: depth-2 pipelining + 1 for headroom.
+                    # Ring of clone sets; needs to be large enough that the next wrap
+                    # doesn't overwrite a slot whose consumer (postprocess) hasn't
+                    # finished reading. With depth-2 pipelining and async postprocess
+                    # that doesn't sync, decode may trail by several frames.
+                    ring_size = int(os.environ.get("ULTRALYTICS_TRT_CLONE_RING", "8"))
                     sorted_names = sorted(self.output_names)
                     self._clone_sets = [
-                        [torch.empty_like(self.bindings[n].data) for n in sorted_names] for _ in range(3)
+                        [torch.empty_like(self.bindings[n].data) for n in sorted_names] for _ in range(ring_size)
                     ]
+                    # Per-slot "consumer done reading" events. Postprocess calls
+                    # `mark_slot_consumed(idx)` after it has read the clone; the
+                    # next replay that will reuse this slot waits on this event.
+                    self._slot_consumed = [torch.cuda.Event() for _ in range(ring_size)]
+                    self._last_issued_slot = None
             elif im.data_ptr() != input_buf.data_ptr():
                 input_buf.copy_(im, non_blocking=True)
             current = torch.cuda.current_stream(self.device)
             self._graph_stream.wait_stream(current)
             if self._pipeline_post and self._consumer_done_event is not None:
-                # Next replay must wait for previous frame's clone to finish.
-                self._graph_stream.wait_event(self._consumer_done_event)
+                # Clone ring slot about to be used: wait for its previous consumer
+                # to finish reading it. On the first wrap each slot's event is
+                # un-recorded (no-op wait).
+                self._graph_stream.wait_event(self._slot_consumed[self._clone_idx])
             # CUDAGraph.replay() launches on the current stream, so switch to
             # graph_stream for the launch and all follow-up clone work.
             with torch.cuda.stream(self._graph_stream):
@@ -216,6 +241,7 @@ class TensorRTBackend(BaseBackend):
                         c.copy_(self.bindings[name].data, non_blocking=True)
                     self._graph_event.record(self._graph_stream)
                     self._consumer_done_event.record(self._graph_stream)
+                    self._last_issued_slot = idx
             if self._pipeline_post:
                 current.wait_stream(self._graph_stream)
                 return list(clones)
